@@ -1,0 +1,12 @@
+requests
+pyaudio
+numpy
+ollama
+spidev
+gpiozero
+librosa
+soundfile
+onnxruntime
+transformers
+python-periphery
+Pillow
