@@ -90,4 +90,11 @@ Install all necessary libraries defined in the `requirements.txt` file.
 pip install -r requirements.txt
 ```
 
-The Rubik Pi 3 is now fully configured!
+The Rubik Pi 3 is now fully configured.
+
+### 3.3. Run the Demo
+
+Now that the virtual enviornment is active with all the needed dependancies, you can run the example file
+```bash
+sudo ./src/Primer.py
+```
