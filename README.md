@@ -102,5 +102,5 @@ The Rubik Pi 3 is now fully configured.
 
 Now that the virtual enviornment is active with all the needed dependancies, you can run the example file
 ```bash
-sudo ./src/Primer.py
+sudo ./venv/bin/python src/render-avatar.py
 ```
