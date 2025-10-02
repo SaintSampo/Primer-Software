@@ -66,6 +66,12 @@ Type `/bye` to exit the interactive session.
 
 ## 3. Python Development Environment
 
+### 3.0 install system requirement library
+
+```bash
+sudo usermod -a -G gpio ubuntu
+```
+
 ### 3.1. Creating a Virtual Environment (venv)
 
 Isolating dependencies in a virtual environment is essential for project stability.
@@ -90,4 +96,11 @@ Install all necessary libraries defined in the `requirements.txt` file.
 pip install -r requirements.txt
 ```
 
-The Rubik Pi 3 is now fully configured!
+The Rubik Pi 3 is now fully configured.
+
+### 3.3. Run the Demo
+
+Now that the virtual enviornment is active with all the needed dependancies, you can run the example file
+```bash
+sudo ./venv/bin/python src/render-avatar.py
+```
