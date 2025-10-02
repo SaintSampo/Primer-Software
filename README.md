@@ -66,6 +66,12 @@ Type `/bye` to exit the interactive session.
 
 ## 3. Python Development Environment
 
+### 3.0 install system requirement library
+
+```bash
+sudo apt-get install portaudio19-dev
+```
+
 ### 3.1. Creating a Virtual Environment (venv)
 
 Isolating dependencies in a virtual environment is essential for project stability.
