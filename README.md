@@ -69,7 +69,7 @@ Type `/bye` to exit the interactive session.
 ### 3.0 install system requirement library
 
 ```bash
-sudo apt-get install portaudio19-dev
+sudo apt install python3-periphery
 ```
 
 ### 3.1. Creating a Virtual Environment (venv)
