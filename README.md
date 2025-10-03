@@ -1,4 +1,4 @@
-# Primer AI Kit Demo
+# XRP Primer AI Kit Demo
 
 ## Project Description
 
