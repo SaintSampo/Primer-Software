@@ -14,7 +14,8 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
+lib/whisper/decoder_model.onnx
+lib/whisper/encoder_model.onnx
 lib64/
 parts/
 sdist/
