@@ -64,6 +64,17 @@ ollama run tinyllama
 ```
 Type `/bye` to exit the interactive session.
 
+## 2.4 Whisper Model Setup
+
+**1. Download the Models:**
+You must manually download the following files and place them in the specified directory:
+- **Decoder Model:** Download `decoder_model.onnx` from [Here](https://huggingface.co/onnx-community/whisper-tiny.en/blob/main/onnx/decoder_model.onnx)
+- **Encoder Model:** Download `encoder_model.onnx` from [Here](https://huggingface.co/onnx-community/whisper-tiny.en/blob/main/onnx/encoder_model.onnx)
+
+**2. Placement:**
+Place both files into the following path within your cloned repository:
+`lib/whisper/`
+
 ## 3. Python Development Environment
 
 ### 3.0 install system requirement library
