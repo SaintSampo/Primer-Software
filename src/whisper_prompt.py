@@ -3,342 +3,331 @@
 # voice activity detection (VAD).
 
 # Before running, you must install the required libraries:
-# pip install onnxruntime numpy librosa soundfile
-# For recording and VAD, you also need:
-# pip install PyAudio webrtcvad
-# For a proper tokenizer, you need:
-# pip install transformers
-# For PyAudio on macOS, you may need to first install PortAudio:
-# brew install portaudio
-# For PyAudio on Linux, you may need to first install system dependencies:
-# sudo apt-get install python3-pyaudio
+# pip install onnxruntime numpy soundfile webrtcvad
 
+#!/usr/bin/env python3
+"""
+Minimal Whisper-ONNX runner that uses:
+  - OpenAI Whisper (tiny.en) pre-processing: load_audio -> pad_or_trim -> log_mel_spectrogram
+  - OpenAI Whisper tokenizer post-processing: decode(tokens)
+  - ONNX Runtime for encoder/decoder inference
+
+Recommended decoder: decoder_model.onnx (plain)
+Optional: decoder_model_merged.onnx (with past_key_values + use_cache_branch)
+"""
+# Before running, you must install the required libraries:
+# pip install "optimum-onnx[onnxruntime]" transformers onnx optimum-cli export onnx --model openai/whisper-tiny-en whisper_tiny_en
+# cp encoder_model.onnx and decoder_model.onnx from the export output to /lib/whisper
+
+import argparse
 import onnxruntime as ort
 import numpy as np
+import sounddevice as sd
 import soundfile as sf
-import librosa
-import pyaudio
 import webrtcvad
-import wave
 import os
 import sys
-import time # Added for wait_for_prompt
-from transformers import WhisperProcessor
+import wave
+import time
+import whisper
 
-# --- Model and Tokenizer Initialization ---
+ENCODER_MODEL = "encoder_model.onnx"
+DECODER_MODEL = "decoder_model.onnx"
+MODEL_DIR_PATH = "/home/ubuntu/projects/Primer-Software/lib/whisper"
+RECORD_FILE = "recording.wav"
 
-# NOTE: You must download the ONNX model files first.
-# This example assumes the model and a vocabulary file are in the same directory.
-# We will use separate encoder and decoder models, which is the standard approach.
-ENCODER_MODEL_PATH = "lib/whisper/encoder_model.onnx"
-# We're using the simpler decoder model without a past key-value cache
-DECODER_MODEL_PATH = "lib/whisper/decoder_model.onnx" 
+# ---------- Audio helpers ----------
+def _list_devices():
+    devices = sd.query_devices()
+    lines = []
+    for idx, d in enumerate(devices):
+        if d['max_input_channels'] > 0:
+            lines.append(f"[{idx}] {d['name']} - inputs: {d['max_input_channels']}, samplerate: {int(d['default_samplerate'])}")
+    return "\n".join(lines) if lines else "No input devices found."
 
-# Global variables for PyAudio and VAD objects
-audio = None
-vad = None
+# --- VAD / streaming parameters to align with Whisper + VAD ---
+SAMPLE_RATE = 16000           # Whisper + WebRTC VAD standard
+CHANNELS = 1                  # mono
+FRAME_DURATION_MS = 20        # 10, 20, or 30 ms (20 ms recommended)
+CHUNK = int(SAMPLE_RATE * FRAME_DURATION_MS / 1000)  # samples per frame (320 for 20 ms)
+VAD_AGGRESSIVENESS = 2        # 0..3
+SILENCE_TIMEOUT_MS = 800
+SILENCE_TIMEOUT_FRAMES = max(1, SILENCE_TIMEOUT_MS // FRAME_DURATION_MS)
+MAX_RECORD_SECONDS = 12
 
-# Create the ONNX inference sessions for the encoder and decoder
-try:
-    processor = WhisperProcessor.from_pretrained("openai/whisper-tiny.en")
-    encoder_session = ort.InferenceSession(ENCODER_MODEL_PATH)
-    decoder_session = ort.InferenceSession(DECODER_MODEL_PATH)
-    print("ONNX models and processor loaded successfully.")
-except Exception as e:
-    print(f"Error loading ONNX models or processor: {e}")
-    print("Please ensure the 'encoder_model.onnx' and 'decoder_model.onnx' files exist in the same directory.")
-    sys.exit()
+_vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
 
-# --- Audio Recording with VAD ---
-
-# VAD and Recording Constants
-SAMPLE_RATE = 16000
-FRAME_DURATION_MS = 30  # Frame duration for VAD (must be 10, 20, or 30 ms)
-CHUNK = int(SAMPLE_RATE * FRAME_DURATION_MS / 1000) # Frames per buffer
-FORMAT = pyaudio.paInt16
-CHANNELS = 1
-SILENCE_TIMEOUT_FRAMES = 32  # About 1 second of silence (1s / 30ms = ~32 frames)
-MAX_RECORD_SECONDS = 30
-INPUT_DEVICE_INDEX = None
-
-# Helper to initialize global PyAudio and VAD objects
-def _init_audio_components():
-    """Initializes global PyAudio and VAD objects if they aren't already."""
-    global audio, vad
-    if audio is None:
-        audio = pyaudio.PyAudio()
-    if vad is None:
-        # Aggressiveness mode 3: most aggressive filtering of non-speech
-        vad = webrtcvad.Vad(3)
-
-
-def _record_audio_chunk():
+# ---------- Whisper-ONNX runner ----------
+class WhisperONNXRunner:
     """
-    Records a single chunk of audio from the microphone with VAD.
-    The recording starts when speech is detected and stops after SILENCE_TIMEOUT_FRAMES 
-    of silence or MAX_RECORD_SECONDS.
-    Returns the filename of the recorded WAV file or None if no speech was detected.
+    Supports two decoder types:
+      - Plain decoder: decoder_model.onnx (input_ids + encoder_hidden_states; no caches)
+      - Merged decoder: decoder_model_merged.onnx (input_ids + encoder_hidden_states + past_key_values.* + use_cache_branch)
+    Uses Whisper's official pre/post for consistency with the original pipeline.
     """
-    _init_audio_components() # Ensure PyAudio and VAD are initialized
-    
-    stream = audio.open(format=FORMAT,
-                        channels=CHANNELS,
-                        rate=SAMPLE_RATE,
-                        input=True,
-                        frames_per_buffer=CHUNK,
-                        input_device_index=INPUT_DEVICE_INDEX) 
 
-    frames = []
+    def __init__(self, providers: str = "cpu"):
+        # Locate ONNX files
+        enc_path = os.path.join(MODEL_DIR_PATH, ENCODER_MODEL)
+        dec_path = os.path.join(MODEL_DIR_PATH, DECODER_MODEL)
+        if not (os.path.isfile(enc_path) and os.path.isfile(dec_path)):
+            raise FileNotFoundError(f"Missing ONNX files under {MODEL_DIR_PATH}. Expected encoder_model.onnx and decoder_model.onnx")
+
+        # Providers
+        if providers.lower() == "cuda":
+            ep = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        elif providers.lower() == "dml":
+            ep = ["DmlExecutionProvider", "CPUExecutionProvider"]
+        else:
+            ep = ["CPUExecutionProvider"]
+
+        print(f"🧩 Loading encoder + decoder ({providers})…")
+        self.encoder_sess = ort.InferenceSession(enc_path, providers=ep)
+        self.decoder_sess = ort.InferenceSession(dec_path, providers=ep)
+        print("ONNX models and processor loaded successfully.")
+
+        # Tokenizer (English-only tiny.en)
+        self.tokenizer = whisper.tokenizer.get_tokenizer(multilingual=False)
+        self.eot_id    = self.tokenizer.eot
+        self.sot_seq   = list(self.tokenizer.sot_sequence_including_notimestamps)
+
+        # Encoder I/O
+        self.enc_in  = self.encoder_sess.get_inputs()[0].name   # usually 'input_features'
+        self.enc_out = self.encoder_sess.get_outputs()[0].name  # usually 'encoder_hidden_states'
+
+        # Decoder I/O
+        self.dec_inputs_list = list(self.decoder_sess.get_inputs())
+        self.dec_inputs = {i.name: i for i in self.dec_inputs_list}
+        self.dec_in_ids = next((i.name for i in self.dec_inputs_list if "input_ids" in i.name), None)
+        self.dec_in_enc = next((i.name for i in self.dec_inputs_list if "encoder_hidden_states" in i.name), None)
+
+        # Cache-related (merged only)
+        self.dec_use_branch = next((i.name for i in self.dec_inputs_list if "use_cache_branch" in i.name), None)
+        self.dec_cache_pos  = next((i.name for i in self.dec_inputs_list if "cache_position" in i.name), None)
+        self.past_in_names  = [i.name for i in self.dec_inputs_list if i.name.startswith("past_key_values")]
+        self.is_plain = (self.dec_use_branch is None and len(self.past_in_names) == 0)
+
+        self.dec_outs_list = list(self.decoder_sess.get_outputs())
+        self.dec_outs = [o.name for o in self.dec_outs_list]
+        self.dec_logits = self.dec_outs[0]
+        self.present_out_names = [o.name for o in self.dec_outs_list if o.name.startswith("present.")]
+
+        if self.dec_in_ids is None or self.dec_in_enc is None:
+            raise RuntimeError(f"Decoder missing required inputs: found {list(self.dec_inputs.keys())}")
+
+        print("🔧 Decoder type:", "PLAIN" if self.is_plain else "MERGED")
+
+    # --- Whisper pre-processing (OpenAI reference) ---
+    def _mel(self, audio_path: str) -> np.ndarray:
+        # FFmpeg loader → mono/16k → pad_or_trim → log-mel spectrogram
+        audio = whisper.load_audio(audio_path)
+        audio = whisper.pad_or_trim(audio)
+        mel_t = whisper.log_mel_spectrogram(audio)  # torch.Tensor [80, 3000]
+        mel_np = mel_t.detach().float().cpu().numpy()
+        return np.expand_dims(mel_np, 0)  # [1, 80, 3000]
+
+    # --- dtype helper ---
+    def _dtype_from_onnx(self, onnx_type: str):
+        t = (onnx_type or "").lower()
+        if "float16" in t: return np.float16
+        if "float"    in t: return np.float32
+        if "int64"    in t: return np.int64
+        if "bool"     in t: return np.bool_
+        return np.float32
+
+    # --- merged helpers ---
+    def _zeros_for_past_input(self, inp):
+        dtype = self._dtype_from_onnx(inp.type)
+        shape = []
+        name = inp.name
+        for d in inp.shape:
+            if isinstance(d, int):
+                shape.append(d)
+            else:
+                s = str(d).lower()
+                if "batch" in s: shape.append(1)
+                elif "past_decoder_sequence_length" in s or ("decoder" in name and "past_key_values" in name):
+                    shape.append(0)   # decoder past length = 0
+                elif "encoder_sequence_length" in s or ("encoder" in name and "past_key_values" in name):
+                    shape.append(0)   # encoder past length = 0
+                else: shape.append(1) # heads/head_dim → default 1
+        return np.zeros(shape, dtype=dtype)
+
+    def _init_past_feed(self):
+        feed = {}
+        for inp in self.dec_inputs_list:
+            if inp.name.startswith("past_key_values"):
+                feed[inp.name] = self._zeros_for_past_input(inp)
+        branch_dtype = self._dtype_from_onnx(self.dec_inputs[self.dec_use_branch].type)
+        feed[self.dec_use_branch] = np.asarray([0], dtype=branch_dtype)  # first step: no past
+        if self.dec_cache_pos is not None:
+            pos_dtype = self._dtype_from_onnx(self.dec_inputs[self.dec_cache_pos].type)
+            feed[self.dec_cache_pos] = np.asarray([0], dtype=pos_dtype)
+        return feed
+
+    def _update_past_from_present(self, dec_out_list):
+        next_past = {}
+        for name, arr in zip(self.dec_outs, dec_out_list):
+            if name.startswith("present."):
+                past_name = name.replace("present.", "past_key_values.")
+                next_past[past_name] = arr
+        return next_past
+
+    def transcribe(self, audio_path: str, max_tokens: int = 448, skip_special_tokens: bool = True) -> str:
+        # 1) Pre: log-mel via OpenAI Whisper
+        mel = self._mel(audio_path)
+
+        # 2) Encoder → hidden states
+        enc_hidden = self.encoder_sess.run(None, {self.enc_in: mel})[0]  # [1, encoder_seq_len, hidden]
+
+        # 3) Decoder loop (greedy)
+        tokens = self.sot_seq[:]
+
+        if self.is_plain:
+            # Plain decoder: simplest & robust
+            while len(tokens) < max_tokens:
+                input_ids = np.asarray(tokens, dtype=np.int64).reshape(1, -1)
+                feed = { self.dec_in_ids: input_ids, self.dec_in_enc: enc_hidden }
+                dec_out = self.decoder_sess.run(self.dec_outs, feed)
+                logits = dec_out[0]
+                next_id = int(np.argmax(logits[0, -1]))
+                tokens.append(next_id)
+                if next_id == self.eot_id:
+                    break
+        else:
+            # Merged decoder: init with empty past + branch=0
+            input_ids = np.asarray(tokens, dtype=np.int64).reshape(1, -1)
+            feed = { self.dec_in_ids: input_ids, self.dec_in_enc: enc_hidden }
+            feed.update(self._init_past_feed())
+            dec_out = self.decoder_sess.run(self.dec_outs, feed)
+            logits = dec_out[0]
+            past = self._update_past_from_present(dec_out)
+
+            # subsequent steps: branch=1 + reuse past
+            branch_dtype = self._dtype_from_onnx(self.dec_inputs[self.dec_use_branch].type)
+            use_past_arr = np.asarray([1], dtype=branch_dtype)
+
+            while len(tokens) < max_tokens:
+                next_id = int(np.argmax(logits[0, -1]))
+                tokens.append(next_id)
+                if next_id == self.eot_id:
+                    break
+
+                input_ids = np.asarray([next_id], dtype=np.int64).reshape(1, -1)
+                feed = {
+                    self.dec_in_ids: input_ids,
+                    self.dec_in_enc: enc_hidden,
+                    self.dec_use_branch: use_past_arr,
+                    **past,
+                }
+                dec_out = self.decoder_sess.run(self.dec_outs, feed)
+                logits = dec_out[0]
+                past = self._update_past_from_present(dec_out)
+
+        # 4) Post: Whisper tokenizer -> text
+        return self.tokenizer.decode(tokens).strip()
+
+def _record_audio_chunk_sd(device=None):
+    """
+    Records a single chunk of speech using WebRTC VAD with sounddevice.
+    Starts when speech is detected and stops after trailing silence or max time.
+    Returns path to a temp WAV (16-bit PCM, mono, 16k) or None if no speech.
+    """
+    try:
+        sd.check_input_settings(device=device, samplerate=SAMPLE_RATE, channels=CHANNELS, dtype='int16')
+    except Exception as e:
+        print("Device check failed:", e)
+        print("Available input devices:\n", _list_devices())
+        return None
+
+    print("  Listening for speech to start…")
+    frames_bytes = []
     speaking = False
     silence_frames = 0
     total_frames = 0
-    
-    # Wait for initial speech
-    print("  Listening for speech to start...")
-    while not speaking:
-        try:
-            frame_data = stream.read(CHUNK, exception_on_overflow=False)
-            is_speech = vad.is_speech(frame_data, SAMPLE_RATE)
-            if is_speech:
-                print("  Speech detected. Recording...")
-                speaking = True
-                frames.append(frame_data)
-        except Exception:
-            # Continue to wait for speech
-            continue
+    max_frames = int(MAX_RECORD_SECONDS * 1000 / FRAME_DURATION_MS)
 
-    # Continue recording until silence or max time is hit
-    while True:
-        try:
-            frame_data = stream.read(CHUNK, exception_on_overflow=False)
-            is_speech = vad.is_speech(frame_data, SAMPLE_RATE)
+    with sd.RawInputStream(samplerate=SAMPLE_RATE,
+                           blocksize=CHUNK,
+                           channels=CHANNELS,
+                           dtype='int16',
+                           device=device) as stream:
+        while True:
+            data, overflowed = stream.read(CHUNK)  # raw bytes (int16 mono)
+            is_speech = _vad.is_speech(data, SAMPLE_RATE)
 
-            frames.append(frame_data)
-            
-            if not is_speech:
-                silence_frames += 1
-            else:
-                silence_frames = 0 # Reset counter on speech
+            if not speaking:
+                if is_speech:
+                    print("  Speech detected. Recording…")
+                    speaking = True
+                    frames_bytes.append(data)
+                continue
 
+            frames_bytes.append(data)
+            silence_frames = 0 if is_speech else (silence_frames + 1)
             total_frames += 1
-            
-            # Stop if silence timeout is reached
+
             if silence_frames > SILENCE_TIMEOUT_FRAMES:
-                print(f"  Detected {silence_frames * FRAME_DURATION_MS / 1000}s of silence. Chunk finished.")
+                print(f"  Detected {(silence_frames * FRAME_DURATION_MS) / 1000:.2f}s of silence. Chunk finished.")
                 break
-            
-            # Stop if max time is reached
-            if total_frames * FRAME_DURATION_MS / 1000 >= MAX_RECORD_SECONDS:
+            if total_frames >= max_frames:
                 print("  Maximum recording time reached. Stopping chunk.")
                 break
-        except KeyboardInterrupt:
-            raise # Let main loop handle KeyboardInterrupt
-        except Exception as e:
-            print(f"Error during recording: {e}")
-            break
 
-    stream.stop_stream()
-    stream.close()
-    
-    if not frames:
+    if not frames_bytes:
         print("  No speech was recorded in this chunk.")
         return None
 
-    # Save to a temporary file
+    # Save the captured bytes as a WAV file compatible with your playback & Whisper
     temp_file = f"recorded_chunk_{int(time.time())}.wav"
-    wf = wave.open(temp_file, 'wb')
-    wf.setnchannels(CHANNELS)
-    wf.setsampwidth(audio.get_sample_size(FORMAT))
-    wf.setframerate(SAMPLE_RATE)
-    wf.writeframes(b''.join(frames))
-    wf.close()
-    
+    with wave.open(temp_file, 'wb') as wf:
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(2)  # int16
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(b''.join(frames_bytes))
+
     print(f"  Audio chunk saved to '{temp_file}'")
+
     return temp_file
 
+def _record_and_transcribe_chunk(runner, device=None):
+        """
+        Record a VAD chunk → transcribe with WhisperONNXRunner → cleanup temp WAV.
+        Returns transcription string or None.
+        """
+        audio_path = _record_audio_chunk_sd(device=device)
+        if not audio_path:
+            return None
+        try:
+            text = runner.transcribe(audio_path)
+        finally:
+            try:
+                os.remove(audio_path)
+            except Exception:
+                pass
+        return text
 
-def _record_and_transcribe_chunk():
-    """Records an audio chunk and returns its transcription. Cleans up the file."""
-    audio_path = _record_audio_chunk()
-    if not audio_path:
-        return None
-        
-    transcribed_text = transcribe_audio_internal(audio_path)
-    
-    # Clean up the temporary file
-    os.remove(audio_path)
-    
-    return transcribed_text
-
-
-# --- New wait_for_prompt Function ---
-
-def wait_for_prompt(trigger_word: str):
+def wait_for_prompt(trigger_word: str, runner, device=None):
     """
-    Continuously listens for audio, transcribes it, and returns the full 
-    transcription only if it contains the specified trigger word.
-    
-    :param trigger_word: The word that must be spoken to return the prompt (case-insensitive).
-    :return: The full transcribed text as a string, or None if interrupted.
+    Loop: record chunk -> transcribe -> return full transcription once it contains trigger_word.
+    Returns the transcription (prompt) string, or None on KeyboardInterrupt.
     """
-    
     print(f"\n--- Awaiting Trigger Word: '{trigger_word.upper()}' ---")
-    
     try:
         while True:
-            # 1. Record a chunk of speech and transcribe it
-            transcribed_text = _record_and_transcribe_chunk()
-
-            if transcribed_text:
-                # 2. Check if the transcription contains the trigger word
-                if trigger_word.lower() in transcribed_text.lower():
+            prompt = _record_and_transcribe_chunk(runner, device=device)
+            if prompt:
+                if trigger_word.lower() in prompt.lower():
                     print("\n!!! Trigger Word Detected !!!")
-                    print(f"Full Prompt: {transcribed_text.strip()}")
-                    # 3. Return the prompt
-                    return transcribed_text.strip()
+                    print(f"Full Prompt: {prompt.strip()}")
+                    return prompt.strip()
                 else:
                     print(f"Prompt thrown out (no '{trigger_word}' detected). Re-listening.")
                     print("-" * 30)
             else:
                 print("No clear speech detected. Re-listening.")
                 print("-" * 30)
-                
     except KeyboardInterrupt:
         print("\nListening stopped by user (KeyboardInterrupt).")
         return None
-    finally:
-        # Important: terminate PyAudio when done with all listening
-        global audio
-        if audio:
-            audio.terminate()
-            audio = None
-            print("PyAudio terminated.")
-
-def cleanup_audio():
-    """Important: terminate PyAudio when done with all listening."""
-    global audio
-    if audio:
-        audio.terminate()
-        audio = None
-        print("PyAudio terminated.")
-
-# --- Audio Preprocessing Function (Simplified) ---
-# NOTE: Renamed to preprocess_audio_internal to avoid confusion with the public 
-# function in the original file, though the original was only used internally anyway.
-def preprocess_audio_internal(audio_path):
-    """
-    Loads and preprocesses an audio file for the Whisper model.
-    The model expects a 16kHz, single-channel Mel spectrogram.
-    """
-    try:
-        # Load audio data and resample to 16kHz
-        audio, sr = librosa.load(audio_path, sr=16000, mono=True)
-    except Exception as e:
-        print(f"Error loading audio file: {e}")
-        print("Please ensure the audio file exists and is a supported format.")
-        return None
-
-    # Compute the log-Mel spectrogram using the processor
-    mel_spec = processor.feature_extractor(
-        audio, 
-        sampling_rate=16000, 
-        return_tensors="np"
-    ).input_features
     
-    # Pad the spectrogram to a fixed size (e.g., 30 seconds)
-    max_len = 3000
-    if mel_spec.shape[2] > max_len:
-        mel_spec = mel_spec[:, :, :max_len]
-    else:
-        # Note: Padding with zeros is a simple approach; proper handling (like in the original paper) 
-        # may involve more complex padding or chunking for longer audio.
-        padding = np.zeros((mel_spec.shape[0], mel_spec.shape[1], max_len - mel_spec.shape[2]), dtype=np.float32)
-        mel_spec = np.concatenate([mel_spec, padding], axis=2)
-    
-    return mel_spec
-
-# --- Main Transcription Logic (Internal Version) ---
-# NOTE: Renamed the original 'transcribe_audio' to 'transcribe_audio_internal'
-# to make it clear this is a backend logic function.
-def transcribe_audio_internal(audio_path):
-    """
-    Transcribes a given audio file using the ONNX model.
-    Returns the transcribed text string.
-    """
-    print(f"  Preprocessing audio from: {audio_path}")
-    mel_spec = preprocess_audio_internal(audio_path)
-    if mel_spec is None:
-        return ""
-
-    # Use the encoder model to process the audio input
-    encoder_input_name = encoder_session.get_inputs()[0].name
-    encoder_outputs = encoder_session.run(None, {encoder_input_name: mel_spec})
-    encoder_output = encoder_outputs[0]
-
-    # Initialize decoder input with the special tokens
-    decoder_input_ids = [processor.tokenizer.convert_tokens_to_ids("<|startoftext|>")]
-    # Manually define forced tokens to guide the model
-    forced_tokens = [
-        processor.tokenizer.convert_tokens_to_ids("<|transcribe|>"),
-        processor.tokenizer.convert_tokens_to_ids("<|en|>")
-    ]
-
-    # Simple greedy decoding loop
-    token_ids = []
-    
-    print("  Starting decoding loop...")
-    for i in range(100):  # Maximum number of tokens to generate
-        # Force the first few tokens to guide the model
-        if i < len(forced_tokens):
-            next_token = forced_tokens[i]
-        else:
-            # Run the decoder model to predict the next token
-            decoder_outputs = decoder_session.run(
-                None, 
-                {
-                    "input_ids": np.array([decoder_input_ids], dtype=np.int64),
-                    "encoder_hidden_states": encoder_output
-                }
-            )
-            
-            logits = decoder_outputs[0]
-            
-            # Get the next token ID with the highest probability
-            next_token = np.argmax(logits[0, -1, :])
-        
-        # print(f"  Step {i+1}: Next token ID is {next_token}") # Verbose output removed
-
-        # Stop if end of sequence token is predicted
-        if next_token == processor.tokenizer.eos_token_id:
-            print("  End of sequence token detected. Stopping decoding.")
-            break
-        
-        # Append the new token to the input for the next step
-        decoder_input_ids.append(next_token)
-        
-        # We need to skip the special tokens for the final transcription
-        if next_token not in processor.tokenizer.all_special_ids:
-            token_ids.append(next_token)
-
-    # Decode the token IDs to text using the processor's tokenizer
-    transcribed_text = processor.tokenizer.decode(
-        token_ids, 
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=True
-    )
-
-    print(f"  Transcription: '{transcribed_text.strip()}'")
-    return transcribed_text.strip()
-
-# --- Example Usage ---
-if __name__ == "__main__":
-    # The original logic is now a test
-    print("--- Running Whisper Prompt Test ---")
-    try:
-        # Changed to 'whisper' for a self-contained test
-        prompt = wait_for_prompt("whisper") 
-        if prompt:
-            print("\n--- Successful Prompt Received ---")
-            print(f"Your command is: {prompt}")
-    finally:
-        cleanup_audio() # This is the crucial line

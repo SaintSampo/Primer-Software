@@ -54,6 +54,7 @@ class EPD:
         self.GRAY2  = GRAY2
         self.GRAY3  = GRAY3 #gray
         self.GRAY4  = GRAY4 #Blackest
+        
     
     # Hardware reset
     def reset(self):

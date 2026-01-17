@@ -1,4 +1,6 @@
 # /*****************************************************************************
+# Using cdevGPIO now
+# /*****************************************************************************
 # * | File        :	  epdconfig.py
 # * | Author      :   Waveshare team
 # * | Function    :   Hardware underlying interface
@@ -37,28 +39,30 @@ from ctypes import *
 
 logger = logging.getLogger(__name__)
 
-
 class RubikPi:
+    GPIOCHIP = "/dev/gpiochip4"
     # Pin definition
-    RST_PIN  = 8 + 547 #17
-    DC_PIN   = 44 + 547 #25
-    CS_PIN   = 55 + 547 #8
-    BUSY_PIN = 27 + 547 #24
-    PWR_PIN  = 101 + 547 #18
-    MOSI_PIN = 49 + 547 #10
-    SCLK_PIN = 50 + 547 #11
-
+    RST_PIN  = 8 #17
+    DC_PIN   = 44 #25
+    CS_PIN   = 55 #8
+    BUSY_PIN = 27 #24
+    PWR_PIN  = 101 #18
+    MOSI_PIN = 49 #10
+    SCLK_PIN = 50 #11
+    
     def __init__(self):
         import spidev
         from periphery import GPIO
-
+        
+        # Open SPI device
         self.SPI = spidev.SpiDev()
-        self.GPIO_RST_PIN    = GPIO(self.RST_PIN, "out")
-        self.GPIO_DC_PIN     = GPIO(self.DC_PIN, "out")
-        # self.GPIO_CS_PIN     = GPIO(self.CS_PIN, "out")
-        self.GPIO_PWR_PIN    = GPIO(self.PWR_PIN, "out")
-        self.GPIO_BUSY_PIN   = GPIO(self.BUSY_PIN, "in")
 
+        # Open GPIO pins
+        self.GPIO_RST_PIN    = GPIO(self.GPIOCHIP, self.RST_PIN, "out")
+        self.GPIO_DC_PIN     = GPIO(self.GPIOCHIP, self.DC_PIN, "out")
+        # self.GPIO_CS_PIN     = GPIO(self.GPIOCHIP, self.CS_PIN, "out")
+        self.GPIO_PWR_PIN    = GPIO(self.GPIOCHIP, self.PWR_PIN, "out")
+        self.GPIO_BUSY_PIN   = GPIO(self.GPIOCHIP, self.BUSY_PIN, "in")
         
 
     def digital_write(self, pin, value):

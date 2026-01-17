@@ -3,7 +3,7 @@
 
 import time
 import re
-from whisper_prompt import wait_for_prompt, cleanup_audio
+import whisper_prompt
 from render_avatar import set_stage, render_paragraph
 # --- IMPORT FROM OLLAMA-CHAT.PY ---
 from ollama_chat import get_primer_response, INITIAL_MESSAGES_HISTORY 
@@ -11,6 +11,7 @@ from ollama_chat import get_primer_response, INITIAL_MESSAGES_HISTORY
 # --- Configuration ---
 TRIGGER_WORD = "Primer"
 OLLAMA_MODEL = "tinyllama" 
+RECORD_FILE = "recording.wav"
 
 # Initialize the conversation history using the imported setup
 messages_history = INITIAL_MESSAGES_HISTORY
@@ -59,8 +60,14 @@ def main_loop():
         
         while True:
             # 1. Listen for prompt
-            prompt = wait_for_prompt(TRIGGER_WORD)
-            
+            runner = whisper_prompt.WhisperONNXRunner()
+            prompt = whisper_prompt.wait_for_prompt(TRIGGER_WORD, runner, device=None)
+            if TRIGGER_WORD.lower() in prompt.lower():
+                print(f"\n✅ Trigger word '{TRIGGER_WORD}' detected in transcription!")
+            else:
+                print(f"\n❌ Trigger word '{TRIGGER_WORD}' NOT detected in transcription.")
+                break
+
             if prompt is None: # User interrupted
                 break
                 
@@ -73,11 +80,7 @@ def main_loop():
             else:
                 print(f"\nSending user question to Ollama: {user_question}")
                  # 3. Get AI Response using the imported function
-                ai_response, messages_history = get_primer_response(
-                    user_question, 
-                    messages_history, 
-                    OLLAMA_MODEL
-                )
+                ai_response, messages_history = get_primer_response( user_question, messages_history, OLLAMA_MODEL)
 
             # 4. Parse and Display
             parse_and_display(ai_response)
@@ -87,8 +90,10 @@ def main_loop():
     finally:
         # Clean up the display and audio resources
         set_stage("Sleeping") # Clears display and puts it to sleep
-        cleanup_audio()
+
         print("Primer is signing off.")
 
 if __name__ == "__main__":
     main_loop()
+
+###### END OF FILE ######

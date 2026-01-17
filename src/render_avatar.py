@@ -16,6 +16,7 @@ import traceback
 
 # Initialize the E-Paper display and fonts
 epd = epd7in5_V2.EPD()
+
 font24 = ImageFont.truetype(os.path.join(picdir, 'Font.ttc'), 24)
 font18 = ImageFont.truetype(os.path.join(picdir, 'Font.ttc'), 18)
 font35 = ImageFont.truetype(os.path.join(picdir, 'Font.ttc'), 35)
@@ -27,6 +28,7 @@ def set_stage(emotion):
     """
     Sets the background and character image on the e-paper display.
     """
+    
     epd.init()
     epd.Clear()
 
